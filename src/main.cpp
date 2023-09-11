@@ -4,6 +4,7 @@
 //#include <ESP8266WiFi.h>
 //#include <PubSubClient.h>
 #include <GyverPortal.h>
+#include <GyverFilters.h>
 #include <EEPROM.h>
 #include <LittleFS.h>
 
@@ -18,37 +19,48 @@ struct Filter {
 struct MemoryData {
   char ssid[20];
   char pass[20];
-  int correctionFactor_1; //2280
-  int correctionFactor_2; //2280
+  int correctionFactor_1; //2280 impulses in 1 litre
+  int correctionFactor_2; //2280 impulses in 1 litre
   Filter filter1;
   Filter filter2;
   Filter filter3;
   Filter filter4;
   Filter filter5;
 };
-struct Variables {
+struct VariableCounters {
   int LastInputImp = -1;
   int LastOutputImp = -1;
-  byte flagInput = 0;
-  byte flagOutput = 0;
+  byte flagInput = 0;   //position of rotor indicator
+  byte flagOutput = 0;  //position of rotor indicator
+};
+struct VariableTds {
+  GFilterRA tdsAnalog1;   //Running average
+  GFilterRA tdsAnalog2;   //Running average
+  float tdsSensor1 = 0;   //value TDS of sensor 1
+  float tdsSensor2 = 0;   //value TDS of sensor 2
+  float temperature = 25; //temperature for correction (not used)
 };
 
 const String version = "2.0.0";
-const byte PIN_COUNTER_1 = 22; //mini D1
-const byte PIN_COUNTER_2 = 21; //mini D2
-const long PERIOD = 1000;
-const char rotor[4] = {'/', '-', '\\', '|'};
-const int defaultCorrectionFactor = 2280;
+const byte PIN_COUNTER_1 = 21;  //PIN of first counter
+const byte PIN_COUNTER_2 = 22;  //PIN of second counter
+const byte PIN_TDS_1 = 19;      //PIN of first TDS sensor
+const byte PIN_TDS_2 = 23;      //PIN of second TDS sensor
+const long PERIOD = 250;        //periud of update display
+const char rotor[4] = {'/', '-', '\\', '|'};//imitation actions of rotor
+const int defaultCorrectionFactor = 2280;   //default impulses in 1 litre
+const double analogFactor = 3.3 / 4095.0;   //conversing analog value = analogMaxVoltage / analogDiscrete
 
-MemoryData memoryData;
-Variables variables;
-GyverPortal ui(&LittleFS);
-unsigned long timer;
-volatile int InputImp = 0;
-volatile int OutputImp = 0;
+MemoryData memoryData;            //strucure for saving
+VariableCounters variableCounters;//strucure of counter
+VariableTds variableTds;          //strucure of TDS sensors
+GyverPortal ui(&LittleFS);  //Web UI
+unsigned long timer;        //Timer for updating
+volatile int InputImp = 0;  //Impulses count of counter 1 by interrupt
+volatile int OutputImp = 0; //Impulses count of counter 2 by interrupt
 byte mode = 0;
 
-WiFiClient espClient;
+WiFiClient espClient;       //WiFi
 
 void SaveData(bool force) {
   if (mode > 0  || force) {
@@ -84,26 +96,39 @@ void UpdateFilters(bool counter, int liters)
   if (isNeedSave) SaveData(false);
 }
 
-void CheckLiters()
+void CheckSensors()
 {
-  if (variables.LastInputImp != InputImp) {
+  if (variableCounters.LastInputImp != InputImp) {
     if (InputImp > memoryData.correctionFactor_1) {
       int l = InputImp / memoryData.correctionFactor_1;
       InputImp -= l * memoryData.correctionFactor_1;
       UpdateFilters(true, l);
       Serial.print("Counter 1: spent "); Serial.print(l); Serial.println(" liter(s)");
     }
-    variables.flagInput = (variables.flagInput + 1) % 4;
+    variableCounters.flagInput = (variableCounters.flagInput + 1) % 4;
   }
 
-  if (variables.LastOutputImp != OutputImp) {
+  if (variableCounters.LastOutputImp != OutputImp) {
     if (OutputImp > memoryData.correctionFactor_2) {
       int l = OutputImp / memoryData.correctionFactor_2;
       OutputImp -= l * memoryData.correctionFactor_2;
       UpdateFilters(false, l);
       Serial.print("Counter 2: spent "); Serial.print(l); Serial.println(" liter(s)");
     }
-    variables.flagOutput = (variables.flagOutput + 1) % 4;
+    variableCounters.flagOutput = (variableCounters.flagOutput + 1) % 4;
+  }
+
+  float compensationCoefficient = 1.0 + 0.02 * (variableTds.temperature - 25.0);
+  {
+    int averageVoltage = variableTds.tdsAnalog1.filteredTime(analogRead(PIN_TDS_1)) * analogFactor;
+    float compensationVoltage = averageVoltage / compensationCoefficient;
+    variableTds.tdsSensor1 = (133.42 * pow(compensationVoltage, 3) - 255.86 * pow(compensationVoltage, 2) + 857.39 * compensationVoltage) * 0.5;
+  }
+
+  {
+    int averageVoltage = variableTds.tdsAnalog1.filteredTime(analogRead(PIN_TDS_2)) * analogFactor;
+    float compensationVoltage = averageVoltage / compensationCoefficient;
+    variableTds.tdsSensor2 = (133.42 * pow(compensationVoltage, 3) - 255.86 * pow(compensationVoltage, 2) + 857.39 * compensationVoltage) * 0.5;
   }
 }
 
@@ -115,15 +140,19 @@ void Build() {
   GP.ONLINE_CHECK();
   if (ui.uri("/")) {
     M_BLOCK_TAB("FilterValue",
-      M_BOX(GP.LABEL("1. Resource balance"); GP.LABEL(String(memoryData.filter1.remainingResource)););
+      M_BOX(GP.LABEL("1. Resource balance, L"); GP.LABEL(String(memoryData.filter1.remainingResource)); GP.LED("ledf1rb", memoryData.filter1.remainingResource > 1000 ? 1 : 0););
       GP.HR();
-      M_BOX(GP.LABEL("2. Resource balance"); GP.LABEL(String(memoryData.filter2.remainingResource)););
+      M_BOX(GP.LABEL("2. Resource balance, L"); GP.LABEL(String(memoryData.filter2.remainingResource)); GP.LED("ledf2rb", memoryData.filter2.remainingResource > 1000 ? 1 : 0););
       GP.HR();
-      M_BOX(GP.LABEL("3. Resource balance"); GP.LABEL(String(memoryData.filter3.remainingResource)););
+      M_BOX(GP.LABEL("3. Resource balance, L"); GP.LABEL(String(memoryData.filter3.remainingResource)); GP.LED("ledf3rb", memoryData.filter3.remainingResource > 1000 ? 1 : 0););
       GP.HR();
-      M_BOX(GP.LABEL("4. Resource balance"); GP.LABEL(String(memoryData.filter4.remainingResource)););
+      M_BOX(GP.LABEL("4. Resource balance, L"); GP.LABEL(String(memoryData.filter4.remainingResource)); GP.LED("ledf4rb", memoryData.filter4.remainingResource > 1000 ? 1 : 0););
       GP.HR();
-      M_BOX(GP.LABEL("5. Resource balance"); GP.LABEL(String(memoryData.filter5.remainingResource)););
+      M_BOX(GP.LABEL("5. Resource balance, L"); GP.LABEL(String(memoryData.filter5.remainingResource)); GP.LED("ledf5rb", memoryData.filter5.remainingResource > 1000 ? 1 : 0););
+      GP.HR();
+      M_BOX(GP.LABEL("TDS before filter, ppm"); GP.LABEL(String(variableTds.tdsSensor1)); GP.LED("ledTds1", variableTds.tdsSensor1 < 50 ? 1 : 0););
+      GP.HR();
+      M_BOX(GP.LABEL("TDS after filter, ppm"); GP.LABEL(String(variableTds.tdsSensor2)); GP.LED("ledTds1", variableTds.tdsSensor2 < 50 ? 1 : 0););
     );
   } else if (ui.uri("/wifi")) {
     GP.FORM_BEGIN("/wifi");
@@ -137,16 +166,16 @@ void Build() {
     GP.FORM_BEGIN("/settings");
     M_BLOCK_TAB("FILTERS",
       M_BOX(GP.LABEL("1. First counter"); GP.CHECK("f1c", memoryData.filter1.isFirstCounter););
-      M_BOX(GP.LABEL("1. Resource balance"); GP.NUMBER("f1rb", "10000", memoryData.filter1.remainingResource););
+      M_BOX(GP.LABEL("1. Resource balance"); GP.NUMBER("f1rb", "50000", memoryData.filter1.remainingResource););
       GP.HR();
       M_BOX(GP.LABEL("2. First counter"); GP.CHECK("f2c", memoryData.filter2.isFirstCounter););
       M_BOX(GP.LABEL("2. Resource balance"); GP.NUMBER("f2rb", "10000", memoryData.filter2.remainingResource););
       GP.HR();
       M_BOX(GP.LABEL("3. First counter"); GP.CHECK("f3c", memoryData.filter3.isFirstCounter););
-      M_BOX(GP.LABEL("3. Resource balance"); GP.NUMBER("f3rb", "10000", memoryData.filter3.remainingResource););
+      M_BOX(GP.LABEL("3. Resource balance"); GP.NUMBER("f3rb", "50000", memoryData.filter3.remainingResource););
       GP.HR();
       M_BOX(GP.LABEL("4. First counter"); GP.CHECK("f4c", memoryData.filter4.isFirstCounter););
-      M_BOX(GP.LABEL("4. Resource balance"); GP.NUMBER("f4rb", "10000", memoryData.filter4.remainingResource););
+      M_BOX(GP.LABEL("4. Resource balance"); GP.NUMBER("f4rb", "150000", memoryData.filter4.remainingResource););
       GP.HR();
       M_BOX(GP.LABEL("5. First counter"); GP.CHECK("f5c", memoryData.filter5.isFirstCounter););
       M_BOX(GP.LABEL("5. Resource balance"); GP.NUMBER("f5rb", "10000", memoryData.filter5.remainingResource););
@@ -162,6 +191,7 @@ void Build() {
     GP.HR();    
     GP.BUTTON_LINK("https://heltec.org/project/wifi-kit-32/", "Heltec wifi kit 32");
     GP.BUTTON_LINK("https://github.com/GyverLibs/GyverPortal", "UI GyverPortal");
+    GP.BUTTON_LINK("https://github.com/GyverLibs/GyverFilters", "Running average GyverFilters");
     GP.BUTTON_LINK("https://github.com/DoroganovV", "Autor Vitaly Doroganov");
     GP.HR();
     GP.OTA_FIRMWARE("Upload firmware");
@@ -186,11 +216,13 @@ void PinSetup() {
   pinMode(BUILTIN_LED, OUTPUT);
   pinMode(PIN_COUNTER_1, INPUT_PULLUP);
   pinMode(PIN_COUNTER_2, INPUT_PULLUP);
+  pinMode(PIN_TDS_1, INPUT);
+  pinMode(PIN_TDS_2, INPUT);
   
   attachInterrupt(digitalPinToInterrupt(PIN_COUNTER_1), Counter_1_Tick, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_COUNTER_2), Counter_2_Tick, RISING);
 
-  CheckLiters();
+  CheckSensors();
 }
 
 void Action(GyverPortal& p) {
@@ -223,15 +255,15 @@ void Action(GyverPortal& p) {
     strcpy(memoryData.ssid, "");
     strcpy(memoryData.pass, "");
     memoryData.filter1.isFirstCounter = true;
-    memoryData.filter1.remainingResource = 10000;
+    memoryData.filter1.remainingResource = 50000;
     memoryData.filter2.isFirstCounter = true;
     memoryData.filter2.remainingResource = 10000;
     memoryData.filter3.isFirstCounter = true;
-    memoryData.filter3.remainingResource = 10000;
+    memoryData.filter3.remainingResource = 50000;
     memoryData.filter4.isFirstCounter = true;
-    memoryData.filter4.remainingResource = 30000;
+    memoryData.filter4.remainingResource = 150000;
     memoryData.filter5.isFirstCounter = false;
-    memoryData.filter5.remainingResource = 5000;
+    memoryData.filter5.remainingResource = 10000;
     memoryData.correctionFactor_1 = defaultCorrectionFactor;
     memoryData.correctionFactor_2 = defaultCorrectionFactor;
     SaveData(true);
@@ -289,18 +321,26 @@ void WiFiSetup() {
   }
   delay(1000);
 }
+void AnalogSetup() {
+  variableTds.tdsAnalog1.setCoef(0.2);
+  variableTds.tdsAnalog1.setStep(10);
+  variableTds.tdsAnalog2.setCoef(0.2);
+  variableTds.tdsAnalog2.setStep(10);
+}
 
 void UpdateDislay()
 {
-  if (variables.LastInputImp != InputImp || variables.LastOutputImp != OutputImp) 
+  //if (variableCounters.LastInputImp != InputImp || variableCounters.LastOutputImp != OutputImp) 
   {
     Heltec.display -> clear();
-    Heltec.display -> drawString(0,  0, String(rotor[variables.flagInput]));
-    Heltec.display -> drawString(60, 0, String(rotor[variables.flagOutput]));
+    Heltec.display -> drawString(0,  0, String(rotor[variableCounters.flagInput]));
+    Heltec.display -> drawString(60, 0, String(rotor[variableCounters.flagOutput]));
     
     Heltec.display -> drawString(0, 10, "Debug mode");
     Heltec.display -> drawString(0, 20, String(InputImp));
-    Heltec.display -> drawString(0, 30,  String(OutputImp));
+    Heltec.display -> drawString(60, 20,  String(OutputImp));
+    Heltec.display -> drawString(0, 30, String(variableTds.tdsSensor1));
+    Heltec.display -> drawString(60, 30,  String(variableTds.tdsSensor2));
     Heltec.display -> display();
   }
 }
@@ -317,6 +357,7 @@ void setup() {
 
   WiFiSetup();
   PortalSetup();
+  AnalogSetup();
   UpdateDislay();
   timer = millis();
 }
@@ -324,16 +365,15 @@ void setup() {
 void loop() {
   if (millis() < timer)
     timer = millis();
-    
   if (millis() - timer >= PERIOD) {
     timer = millis();
     if (mode > 0) {
-      CheckLiters();
+      CheckSensors();
       UpdateDislay();
     }
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
   }
-  variables.LastInputImp = InputImp;
-  variables.LastOutputImp = OutputImp;
+  variableCounters.LastInputImp = InputImp;
+  variableCounters.LastOutputImp = OutputImp;
   ui.tick();
 }
